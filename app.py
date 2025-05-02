@@ -1,64 +1,78 @@
-from flask import Flask, request, jsonify
+# fastAPI.py
+
+from fastapi import FastAPI
+from pymongo import MongoClient
 import pandas as pd
 import numpy as np
 from tensorflow.keras.models import load_model
 import pickle
+from datetime import datetime, timedelta
 
-app = Flask(__name__)
+# =================== Setup FastAPI App ===================
 
-# ================== Load Model and Scaler ==================
+app = FastAPI()
 
-# Load the trained LSTM model
-model = load_model('lstm_expense_predictor.keras')
+# =================== MongoDB Setup ===================
 
-# Load the saved scaler
+mongo_client = MongoClient('mongodb+srv://iims:iims123@raushdb.188ob.mongodb.net/bachat_guru?retryWrites=true&w=majority&appName=raushdb')  
+db = mongo_client['bachat_guru']                   
+collection = db['expenses']                   
+
+# =================== Load Model and Scaler ===================
+
+model = load_model('lstm_expense_predictor.keras', compile=False)  # Adjust path if needed
+
 with open('scaler.pkl', 'rb') as f:
     scaler = pickle.load(f)
 
-# ================== Helper Functions ==================
+# =================== Helper Functions ===================
 
-def clean_and_prepare_data(user_expenses):
-    df = pd.DataFrame(user_expenses)
+def fetch_expense_data_from_mongo(user_id):
+    today = datetime.today()
+    start_date = today - timedelta(days=30)
 
-    # Ensure 'Date' is datetime
-    df['Date'] = pd.to_datetime(df['Date'])
+    expenses_cursor = collection.find(
+        {"userId": user_id, "date": {"$gte": start_date}},
+        {"_id": 0, "date": 1, "amount": 1}
+    )
 
-    # Group by day if multiple expenses in a day
-    daily_totals = df.groupby(df['Date'].dt.date)['amount'].sum().reset_index()
-    daily_totals.rename(columns={'Date': 'date', 'amount': 'amount'}, inplace=True)
+    expenses = list(expenses_cursor)
+    if not expenses:
+        raise Exception(f"No transactions found for user {user_id} in the last 30 days.")
+
+    df = pd.DataFrame(expenses)
+    df['date'] = pd.to_datetime(df['date'])
+
+    return df
+
+def clean_and_prepare_data(df):
+    daily_totals = df.groupby(df['date'].dt.date)['amount'].sum().reset_index()
+    daily_totals.columns = ['date', 'amount']
     daily_totals['date'] = pd.to_datetime(daily_totals['date'])
 
-    # Create full daily range
+    # Create full date range
     full_dates = pd.date_range(start=daily_totals['date'].min(), end=daily_totals['date'].max())
     full_data = pd.DataFrame({'date': full_dates})
     full_data = full_data.merge(daily_totals, how='left', on='date')
 
-    # Calculate average of available expenses
+    # Fill missing dates
     average_expense = daily_totals['amount'].mean()
-
-    # Fill missing dates with the average expense
     full_data['amount'] = full_data['amount'].fillna(average_expense)
 
     return full_data
 
 def prepare_last_30_days(full_data):
     amounts = full_data['amount'].values.reshape(-1, 1)
-
-    # Scale amounts
     scaled_amounts = scaler.transform(amounts)
 
-    # If less than 30 days, pad with average expensea
-    if len(scaled_amounts) < 30:a
+    if len(scaled_amounts) < 30:
         average_value = np.mean(scaled_amounts)
         padding = np.full((30 - len(scaled_amounts), 1), average_value)
         scaled_amounts = np.vstack([padding, scaled_amounts])
 
-    # Take last 30 days
     last_30_days = scaled_amounts[-30:]
     last_30_days = last_30_days.reshape((1, 30, 1))
-
     return last_30_days
-
 
 def predict_next_7_days(last_30_days):
     future_predictions = []
@@ -66,39 +80,36 @@ def predict_next_7_days(last_30_days):
 
     for _ in range(7):
         predicted_scaled = model.predict(current_sequence, verbose=0)
-
-        # Correct reshaping
         new_value = np.reshape(predicted_scaled, (1, 1, 1))
-
         future_predictions.append(predicted_scaled[0, 0])
-
-        # Correct sequence update
         current_sequence = np.concatenate((current_sequence[:, 1:, :], new_value), axis=1)
 
-    # Inverse scale to get real money values
     future_predictions_real = scaler.inverse_transform(np.array(future_predictions).reshape(-1, 1))
+    predictions = future_predictions_real.flatten()
 
-    return future_predictions_real.flatten().tolist()
+    # Clip negative predictions to 0
+    predictions = np.clip(predictions, 0, None)
 
-# ================== Flask API Endpoint ==================
+    return predictions.tolist()
 
-@app.route('/predict-7-days', methods=['POST'])
-def predict():
+# =================== FastAPI Endpoint ===================
+
+@app.get("/predict-7-days-from-mongo")
+def predict_from_mongo(user_id: str):
+    """
+    Predicts future expenses for a given user_id
+    """
+
     try:
-        user_expenses = request.get_json()
-
-        full_data = clean_and_prepare_data(user_expenses)
+        raw_data = fetch_expense_data_from_mongo(user_id)
+        full_data = clean_and_prepare_data(raw_data)
         last_30_days = prepare_last_30_days(full_data)
         predictions = predict_next_7_days(last_30_days)
 
-        return jsonify({
-            'future_expenses': predictions
-        })
-
+        return {
+            "user_id": user_id,
+            "future_expenses": predictions
+        }
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return {"error": str(e)}
 
-# ================== Run Server ==================
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
