@@ -1,0 +1,3 @@
+to run app.py file 
+uvicorn fastAPI:app --reload 
+
